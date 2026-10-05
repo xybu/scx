@@ -4,6 +4,9 @@
 //! Copyright (c) 2026 Galih Tama <galpt@v.recipes>
 
 //! Serves the embedded page plus the live snapshot as JSON on loopback.
+//! Uses tiny_http 0.12 pinned in Cargo.toml with loopback only plus no
+//! TLS plus no store. Binds IPv6 loopback first with IPv4 fallback and
+//! serves no WAN route, so the page plus JSON never leave the host.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -172,13 +175,15 @@ mod tests {
     /* Old snapshots without new fields still decode. */
     #[test]
     fn web_metrics_missing_fields_default() {
-        let txt = "{\"stats\":{\"on_cpu\":1},\"version\":\"4.5.1\"}";
+        let txt = "{\"stats\":{\"on_cpu\":1},\"version\":\"4.7.0\"}";
         let m: WebMetrics = serde_json::from_str(txt).unwrap();
         assert_eq!(m.stats.on_cpu, 1);
         assert_eq!(m.stats.local_moves, 0);
         assert_eq!(m.stats.gate_rejects, 0);
+        assert_eq!(m.stats.preempt_kicks, 0);
+        assert_eq!(m.stats.preempt_skipped, 0);
         assert!(m.per_cpu.is_empty());
-        assert_eq!(m.version, "4.5.1");
+        assert_eq!(m.version, "4.7.0");
         assert_eq!(m.timestamp_ns, 0);
         assert_eq!(m.topology, "");
         let old = "{\"id\":1,\"running_pid\":5,\"slice_ns\":2000000}";
@@ -190,7 +195,7 @@ mod tests {
         assert_eq!(v.as_object().map(|o| o.len()), Some(5));
         let back: WebMetrics = serde_json::from_value(v).unwrap();
         assert_eq!(back.stats.on_cpu, 1);
-        assert_eq!(back.version, "4.5.1");
+        assert_eq!(back.version, "4.7.0");
     }
 
     /* Full snapshot round trips through JSON with live counters. */
@@ -207,29 +212,29 @@ mod tests {
                 local_moves: 10,
                 node_moves: 4,
                 machine_moves: 2,
-                over_moves: 1,
                 kicks: 5,
                 admits: 3,
                 rejects: 1,
                 misses: 2,
-                parks: 2,
                 gate_rejects: 0,
+                preempt_kicks: 1,
+                preempt_skipped: 2,
             },
             per_cpu: vec![
                 crate::stats::PerCpuMetrics {
                     id: 0,
                     smt: false,
                     running_pid: 7,
-                    slice_ns: 2_000_000,
+                    slice_ns: 1_000_000,
                 },
                 crate::stats::PerCpuMetrics {
                     id: 1,
                     smt: true,
                     running_pid: 0,
-                    slice_ns: 2_000_000,
+                    slice_ns: 1_000_000,
                 },
             ],
-            version: "4.5.1".to_string(),
+            version: "4.7.0".to_string(),
             timestamp_ns: 1_700_000_000_000_000_000,
             topology: "cpus=4 seeded".to_string(),
         };
@@ -237,12 +242,14 @@ mod tests {
         assert!(txt.contains("local_moves"));
         assert!(txt.contains("node_moves"));
         assert!(txt.contains("machine_moves"));
-        assert!(txt.contains("over_moves"));
+        assert!(!txt.contains("over_moves"));
         assert!(txt.contains("admits"));
         assert!(txt.contains("rejects"));
         assert!(txt.contains("misses"));
-        assert!(txt.contains("parks"));
+        assert!(!txt.contains("\"parks\""));
         assert!(txt.contains("gate_rejects"));
+        assert!(txt.contains("preempt_kicks"));
+        assert!(txt.contains("preempt_skipped"));
         assert!(txt.contains("slice_ns"));
         assert!(txt.contains("running_pid"));
         assert!(txt.contains("\"smt\":false"));
@@ -257,8 +264,6 @@ mod tests {
         assert!(!txt.contains("bw_moves"));
         assert!(!txt.contains("park_moves"));
         assert!(!txt.contains("enq_no_tctx"));
-        assert!(!txt.contains("preempt_kicks"));
-        assert!(!txt.contains("preempt_skipped"));
         assert!(!txt.contains("freq_khz"));
         assert!(!txt.contains("cur_freq"));
         assert!(!txt.contains("llc_id"));
@@ -268,19 +273,19 @@ mod tests {
         assert_eq!(back.stats.local_moves, 10);
         assert_eq!(back.stats.node_moves, 4);
         assert_eq!(back.stats.machine_moves, 2);
-        assert_eq!(back.stats.over_moves, 1);
         assert_eq!(back.stats.admits, 3);
         assert_eq!(back.stats.rejects, 1);
         assert_eq!(back.stats.misses, 2);
-        assert_eq!(back.stats.parks, 2);
         assert_eq!(back.stats.gate_rejects, 0);
+        assert_eq!(back.stats.preempt_kicks, 1);
+        assert_eq!(back.stats.preempt_skipped, 2);
         assert_eq!(back.per_cpu.len(), 2);
         assert!(!back.per_cpu[0].smt);
         assert!(back.per_cpu[1].smt);
         assert_eq!(back.per_cpu[0].running_pid, 7);
-        assert_eq!(back.per_cpu[0].slice_ns, 2_000_000);
+        assert_eq!(back.per_cpu[0].slice_ns, 1_000_000);
         assert_eq!(back.per_cpu[1].id, 1);
-        assert_eq!(back.version, "4.5.1");
+        assert_eq!(back.version, "4.7.0");
         assert_eq!(back.topology, "cpus=4 seeded");
         let v = merged(&snap);
         assert_eq!(v.as_object().map(|o| o.len()), Some(5));
@@ -323,21 +328,26 @@ mod tests {
         assert!(html.contains("id=\"local-moves\""));
         assert!(html.contains("id=\"node-moves\""));
         assert!(html.contains("id=\"machine-moves\""));
-        assert!(html.contains("id=\"over-moves\""));
         assert!(html.contains("id=\"kicks\""));
         assert!(html.contains("id=\"admits\""));
         assert!(html.contains("id=\"rejects\""));
         assert!(html.contains("id=\"misses\""));
-        assert!(html.contains("id=\"parks\""));
         assert!(html.contains("id=\"gate-rejects\""));
+        assert!(html.contains("id=\"preempt-kicks\""));
+        assert!(html.contains("id=\"preempt-skipped\""));
         assert!(html.contains("on_cpu"));
         assert!(html.contains("total_runtime"));
         assert!(html.contains("uptime_ns"));
         assert!(html.contains("local_moves"));
         assert!(html.contains("node_moves"));
         assert!(html.contains("machine_moves"));
-        assert!(html.contains("over_moves"));
         assert!(html.contains("gate_rejects"));
+        assert!(html.contains("preempt_kicks"));
+        assert!(html.contains("preempt_skipped"));
+        assert!(!html.contains("over_moves"));
+        assert!(!html.contains("over-moves"));
+        assert!(!html.contains("\"parks\""));
+        assert!(!html.contains("id=\"parks\""));
         assert!(!html.contains("global_moves"));
         assert!(!html.contains("global-moves"));
     }
@@ -352,9 +362,11 @@ mod tests {
         assert!(!html.contains("nr_throttled"));
         assert!(!html.contains("bw_moves"));
         assert!(!html.contains("park_moves"));
+        assert!(!html.contains("over_moves"));
+        assert!(!html.contains("over-moves"));
+        assert!(!html.contains("\"parks\""));
+        assert!(!html.contains("id=\"parks\""));
         assert!(!html.contains("enq_no_tctx"));
-        assert!(!html.contains("preempt_kicks"));
-        assert!(!html.contains("preempt_skipped"));
         assert!(!html.contains("freq_khz"));
         assert!(!html.contains("cur_freq"));
         assert!(!html.contains("llc_id"));

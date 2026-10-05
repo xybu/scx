@@ -43,7 +43,7 @@ pub struct Metrics {
     #[stat(desc = "Runnable slice ends with requeue")]
     #[serde(default)]
     pub requeues: u64,
-    #[stat(desc = "Blocks and exits with release")]
+    #[stat(desc = "Blocks and exits")]
     #[serde(default)]
     pub completions: u64,
     #[stat(desc = "Moves from the local tier")]
@@ -55,27 +55,29 @@ pub struct Metrics {
     #[stat(desc = "Moves from the machine tier")]
     #[serde(default)]
     pub machine_moves: u64,
-    #[stat(desc = "Moves from the overflow tail")]
-    #[serde(default)]
-    pub over_moves: u64,
     #[stat(desc = "Idle wakeup kicks sent after insert")]
     #[serde(default)]
     pub kicks: u64,
-    #[stat(desc = "Tasks admitted under the use bound")]
+    #[stat(desc = "Tasks admitted with no bound")]
     #[serde(default)]
     pub admits: u64,
-    #[stat(desc = "Tasks parked on admission reject")]
+    #[stat(
+        desc = "Rejects dead at zero for wire compat with no writer; real rejects count in gate_rejects"
+    )]
     #[serde(default)]
     pub rejects: u64,
-    #[stat(desc = "Wall completions past release plus deadline")]
+    #[stat(desc = "Wall completions past deadline")]
     #[serde(default)]
     pub misses: u64,
-    #[stat(desc = "Overflow parks from misses plus rejects")]
-    #[serde(default)]
-    pub parks: u64,
     #[stat(desc = "Closed gate rejects on stale CPUs plus tasks")]
     #[serde(default)]
     pub gate_rejects: u64,
+    #[stat(desc = "Busy preempts sent with margin plus tail")]
+    #[serde(default)]
+    pub preempt_kicks: u64,
+    #[stat(desc = "Preempts held by margin plus tail plus eligibility")]
+    #[serde(default)]
+    pub preempt_skipped: u64,
 }
 
 /// One card of the per CPU grid.
@@ -158,8 +160,8 @@ impl Metrics {
         writeln!(
             w,
             "[{}] run={} runtime_ns={} uptime_ns={} ins={} req={} done={} \
-             local={} node={} machine={} over={} kick={} adm={} rej={} \
-             miss={} park={} gate={}",
+             local={} node={} machine={} kick={} adm={} rej={} \
+             miss={} gate={} pkick={} pskip={}",
             crate::SCHEDULER_NAME,
             self.on_cpu,
             self.total_runtime,
@@ -170,13 +172,13 @@ impl Metrics {
             self.local_moves,
             self.node_moves,
             self.machine_moves,
-            self.over_moves,
             self.kicks,
             self.admits,
             self.rejects,
             self.misses,
-            self.parks,
             self.gate_rejects,
+            self.preempt_kicks,
+            self.preempt_skipped,
         )?;
         Ok(())
     }
@@ -194,13 +196,13 @@ impl Metrics {
             local_moves: self.local_moves.wrapping_sub(rhs.local_moves),
             node_moves: self.node_moves.wrapping_sub(rhs.node_moves),
             machine_moves: self.machine_moves.wrapping_sub(rhs.machine_moves),
-            over_moves: self.over_moves.wrapping_sub(rhs.over_moves),
             kicks: self.kicks.wrapping_sub(rhs.kicks),
             admits: self.admits.wrapping_sub(rhs.admits),
             rejects: self.rejects.wrapping_sub(rhs.rejects),
             misses: self.misses.wrapping_sub(rhs.misses),
-            parks: self.parks.wrapping_sub(rhs.parks),
             gate_rejects: self.gate_rejects.wrapping_sub(rhs.gate_rejects),
+            preempt_kicks: self.preempt_kicks.wrapping_sub(rhs.preempt_kicks),
+            preempt_skipped: self.preempt_skipped.wrapping_sub(rhs.preempt_skipped),
         }
     }
 }

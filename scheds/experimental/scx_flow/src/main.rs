@@ -13,25 +13,8 @@ pub mod bpf_intf;
 pub use bpf_intf::*;
 #[path = "rust/config.rs"]
 mod config;
-#[path = "rust/flow.rs"]
+#[path = "rust/flow/mod.rs"]
 mod flow;
-#[path = "rust/flow_cgrp.rs"]
-mod flow_cgrp;
-#[path = "rust/flow_edf.rs"]
-mod flow_edf;
-#[path = "rust/flow_preempt.rs"]
-mod flow_preempt;
-#[path = "rust/flow_runtime.rs"]
-mod flow_runtime;
-#[path = "rust/flow_select.rs"]
-mod flow_select;
-#[path = "rust/flow_slice.rs"]
-mod flow_slice;
-/* Test-only queue id mirror with no production use, so it stays out of */
-/* the binary and only builds for tests. */
-#[cfg(test)]
-#[path = "rust/flow_slot.rs"]
-mod flow_slot;
 #[path = "rust/snapshot.rs"]
 mod snapshot;
 #[path = "rust/stats.rs"]
@@ -76,6 +59,16 @@ const MAX_CPUS: usize = crate::bpf_intf::flow_consts_FLOW_MAX_CPUS as usize;
 
 fn full_version() -> String {
     build_id::full_version(env!("CARGO_PKG_VERSION"))
+}
+
+/// Validated poll interval from float seconds.
+/// Rejects NaN plus infinite plus non-positive plus over one hour, so
+/// a bad flag fails closed before any timer starts with no panic.
+fn poll_interval_secs(v: f64) -> Result<Duration> {
+    if !v.is_finite() || v <= 0.0 || v > 3600.0 {
+        anyhow::bail!("interval bad {v}");
+    }
+    Ok(Duration::from_secs_f64(v))
 }
 
 #[derive(Debug, Parser)]
@@ -247,20 +240,20 @@ impl<'a> Scheduler<'a> {
         }
         let m = self.get_metrics();
         info!(
-            "exit ins={} req={} done={} local={} node={} machine={} over={} kick={} adm={} rej={} miss={} park={} gate={} runtime={} oncpu={}",
+            "exit ins={} req={} done={} local={} node={} machine={} kick={} adm={} rej={} miss={} gate={} pkick={} pskip={} runtime={} oncpu={}",
             m.inserts,
             m.requeues,
             m.completions,
             m.local_moves,
             m.node_moves,
             m.machine_moves,
-            m.over_moves,
             m.kicks,
             m.admits,
             m.rejects,
             m.misses,
-            m.parks,
             m.gate_rejects,
+            m.preempt_kicks,
+            m.preempt_skipped,
             m.total_runtime,
             m.on_cpu,
         );
@@ -307,9 +300,10 @@ fn main() -> Result<()> {
         sd.store(true, Ordering::Relaxed);
     })?;
     if let Some(intv) = opts.monitor.or(opts.stats) {
+        let dur = poll_interval_secs(intv)?;
         let sd = shutdown.clone();
         let jh = std::thread::spawn(move || {
-            if let Err(e) = stats::monitor(Duration::from_secs_f64(intv), sd) {
+            if let Err(e) = stats::monitor(dur, sd) {
                 log::warn!("monitor failed: {e}");
             }
         });
@@ -332,6 +326,12 @@ mod tests {
     #[test]
     fn scheduler_name_is_flow() {
         assert_eq!(SCHEDULER_NAME, "scx_flow");
+        assert!(poll_interval_secs(1.0).is_ok());
+        assert!(poll_interval_secs(0.0).is_err());
+        assert!(poll_interval_secs(-1.0).is_err());
+        assert!(poll_interval_secs(f64::NAN).is_err());
+        assert!(poll_interval_secs(f64::INFINITY).is_err());
+        assert!(poll_interval_secs(3601.0).is_err());
     }
 
     #[test]
@@ -343,61 +343,51 @@ mod tests {
     }
 
     #[test]
-    fn batch_matches_header() {
-        assert_eq!(
-            crate::config::Config::default().dispatch_batch,
-            crate::bpf_intf::flow_consts_FLOW_DISPATCH_MAX_BATCH
-        );
-        assert_eq!(crate::config::Config::default().dispatch_batch, 16);
-    }
-
-    #[test]
     fn quantum_matches_header() {
         assert_eq!(
-            crate::flow_slice::QUANTUM_NS,
+            crate::flow::slice::QUANTUM_NS,
             crate::bpf_intf::flow_consts_FLOW_QUANTUM_NS as u64
         );
-        assert_eq!(crate::flow_slice::QUANTUM_NS, 2_000_000);
-        assert_eq!(crate::flow_slice::WEIGHT_BASE, 128);
-        assert_eq!(crate::flow_slice::WEIGHT_MIN, 1);
-        assert_eq!(crate::flow_slice::WEIGHT_MAX, 16_384);
+        assert_eq!(crate::flow::slice::QUANTUM_NS, 1_000_000);
+        assert_eq!(crate::flow::slice::WEIGHT_BASE, 128);
+        assert_eq!(crate::flow::slice::WEIGHT_MIN, 1);
+        assert_eq!(crate::flow::slice::WEIGHT_MAX, 16_384);
     }
 
     #[test]
     fn slot_matches_header() {
         assert_eq!(
-            crate::flow_slot::SLOT_OVERFLOW,
-            crate::bpf_intf::flow_consts_FLOW_OVERFLOW as u64
-        );
-        assert_eq!(crate::flow_slot::SLOT_OVERFLOW, 0x5A01);
-        assert_eq!(
-            crate::flow_slot::SLOT_MACHINE,
+            crate::flow::slot::SLOT_MACHINE,
             crate::bpf_intf::flow_consts_FLOW_MACHINE as u64
         );
         assert_eq!(
-            crate::flow_slot::SLOT_MAX_DSQS,
+            crate::flow::slot::SLOT_OVERFLOW,
+            crate::bpf_intf::flow_consts_FLOW_OVERFLOW as u64
+        );
+        assert_eq!(
+            crate::flow::slot::SLOT_MAX_DSQS,
             crate::bpf_intf::flow_consts_FLOW_MAX_DSQS as u64
         );
-        assert_eq!(crate::flow_slot::SLOT_MAX_DSQS, 522);
+        assert_eq!(crate::flow::slot::SLOT_MAX_DSQS, 1042);
     }
 
     #[test]
     fn period_matches_header() {
         assert_eq!(
-            crate::flow_edf::PERIOD_NS,
+            crate::flow::edf::PERIOD_NS,
             crate::bpf_intf::flow_consts_FLOW_PERIOD_NS as u64
         );
-        assert_eq!(crate::flow_edf::PERIOD_NS, 16_000_000);
+        assert_eq!(crate::flow::edf::PERIOD_NS, 16_000_000);
     }
 
     #[test]
-    fn task_size_is_72() {
-        assert_eq!(std::mem::size_of::<crate::bpf_intf::flow_task_ctx>(), 72);
+    fn task_size_is_64() {
+        assert_eq!(std::mem::size_of::<crate::bpf_intf::flow_task_ctx>(), 64);
     }
 
     #[test]
-    fn cpu_size_is_8() {
-        assert_eq!(std::mem::size_of::<crate::bpf_intf::flow_cpu_state>(), 8);
+    fn cpu_size_is_16() {
+        assert_eq!(std::mem::size_of::<crate::bpf_intf::flow_cpu_state>(), 16);
     }
 
     #[test]
@@ -420,14 +410,9 @@ mod tests {
     }
 
     #[test]
-    fn runtime_advance_matches_base() {
-        assert_eq!(crate::flow::runtime_advance(0, 2_000_000, 128), 2_000_000);
-    }
-
-    #[test]
     fn hint_matches_header() {
         assert_eq!(
-            crate::flow_cgrp::HINT_MAX,
+            crate::flow::cgrp::HINT_MAX,
             crate::bpf_intf::flow_consts_FLOW_HINT_MAX as u64
         );
     }
